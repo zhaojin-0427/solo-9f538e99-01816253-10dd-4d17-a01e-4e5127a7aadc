@@ -355,3 +355,129 @@ class PlateNotFoundDetail(BaseModel):
     error: Literal["plate_not_found"] = "plate_not_found"
     message: str
     plate_id: str
+
+
+# --------------------------------------------------------------- staging API
+
+
+_STAGING_REVISION_KEYS = ("target_revision", "targetRevision", "revision", "rev")
+_ROW_COUNT_KEYS = ("row_count", "rowCount", "rows", "expected_rows")
+_VERSION_KEYS = ("expected_version", "expectedVersion", "seen_version", "version")
+
+
+class StagingRegistrationIn(BaseModel):
+    """Open a staging record for a plate delivered row by row."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    target_revision: int = Field(
+        ge=1,
+        validation_alias=AliasChoices(*_STAGING_REVISION_KEYS),
+        description="Revision number the whole plate will be stored under when "
+        "sealed; must still be ahead of the current revision at seal time",
+    )
+    tested_at: datetime = Field(
+        validation_alias=AliasChoices(*_TESTED_AT_KEYS),
+        description="UTC time the plate was measured",
+    )
+    row_count: int = Field(
+        ge=1,
+        le=4,
+        validation_alias=AliasChoices(*_ROW_COUNT_KEYS),
+        description="How many rows (1-4) the instrument will send",
+    )
+
+    @field_validator("tested_at")
+    @classmethod
+    def _normalise_tested_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
+class StagingRowIn(BaseModel):
+    """One staged row: the existing row shape plus an optimistic version."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    row: RowIn = Field(
+        validation_alias=AliasChoices("row", "data", "payload"),
+        description="The row in the same shape accepted by the whole-plate API",
+    )
+    expected_version: int | None = Field(
+        default=None,
+        ge=1,
+        validation_alias=AliasChoices(*_VERSION_KEYS),
+        description="Version currently stored for this row, required when "
+        "correcting an existing row; omit for the first submission or for an "
+        "identical idempotent retransmit",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_inline_row(cls, data: Any) -> Any:
+        """Also accept the row fields inline alongside ``expected_version``."""
+
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if not any(key in data for key in ("row", "data", "payload")):
+            # The row content was given inline; move the recognised row keys
+            # into a nested "row" object, keeping the version field aside.
+            version = _pop_first(data, _VERSION_KEYS)
+            data = {"row": data}
+            if version is not None:
+                data["expected_version"] = version
+        return data
+
+
+class StagingRowReceiptOut(BaseModel):
+    row_number: int = Field(description="1-based row number as registered")
+    version: int = Field(
+        description="Version of the stored row; starts at 1, increases on every "
+        "accepted correction, unchanged on identical retransmit"
+    )
+    content_hash: str = Field(
+        description="Canonical identity of the stored row content; an identical "
+        "retransmit carries the same hash and is not stored again"
+    )
+    updated_at: datetime
+    row: RowOut
+
+
+class StagingStatusOut(BaseModel):
+    plate_id: str
+    target_revision: int
+    row_count: int
+    tested_at: datetime
+    created_at: datetime
+    sealed: bool
+    sealed_at: datetime | None = None
+    sealed_revision: int | None = None
+    received_rows: list[int] = Field(
+        description="Row numbers currently present in the staging area"
+    )
+    missing_rows: list[int] = Field(
+        description="Row numbers still required before sealing"
+    )
+    rows: list[StagingRowReceiptOut]
+
+
+class StagingErrorDetail(BaseModel):
+    error: Literal[
+        "staging_not_found",
+        "staging_active",
+        "staging_sealed",
+        "row_out_of_range",
+        "row_version_conflict",
+        "staging_incomplete",
+        "plate_validation_failed",
+        "sealed_revision_missing",
+    ]
+    message: str
+    plate_id: str
+    current_version: int | None = None
+    expected_version: int | None = None
+    missing_rows: list[int] | None = None
+    issues: list[str] | None = None
+    sealed_revision: int | None = None
